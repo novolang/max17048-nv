@@ -84,7 +84,7 @@ impl I2cBus for FakeGauge
             return false
         if data.len() != 3
             return true
-        let w = ((data[1] as Int) << 8) | (data[2] as Int)
+        let w = (data[1] as Int << 8) | data[2] as Int
         if reg == 0xFE
             if w == 0x5400
                 power_up(self)
@@ -125,13 +125,21 @@ impl GpioOut for FakePins
 
 // A gauge at its power-up values.
 fn gauge() -> FakeGauge
-    let g = FakeGauge { regs: HashMap.new(), log: HashMap.new(), deaf: HashMap.new(), mute: HashMap.new(), here: 0x36 }
+    let g = FakeGauge { regs: HashMap.new(),
+        log: HashMap.new(),
+        deaf: HashMap.new(),
+        mute: HashMap.new(),
+        here: 0x36 }
     power_up(g)
     g
 
 // Nothing at the part's address.
 fn absent() -> FakeGauge
-    FakeGauge { regs: HashMap.new(), log: HashMap.new(), deaf: HashMap.new(), mute: HashMap.new(), here: 0x37 }
+    FakeGauge { regs: HashMap.new(),
+        log: HashMap.new(),
+        deaf: HashMap.new(),
+        mute: HashMap.new(),
+        here: 0x37 }
 
 let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x36), 7)
 
@@ -284,7 +292,7 @@ fn test_the_identity_is_the_version_register() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x0010)
             test.assert_eq(id.rev ?? -1, 2)
-        None => test.assert(false)
+        None     => test.assert(false)
     test.assert(max17048.start(g, W))
     // The write count is 0: starting does not change the part.
     test.assert_eq(at(g.log, -1), 0)
@@ -321,7 +329,7 @@ fn test_a_battery_reading_is_voltage_charge_and_direction() [io, hw]
             test.assert_eq(r.percent ?? -1, 88)
             test.assert(r.charge == ChargeState.ChargeConstantCurrent)
             test.assert(dev_power.power_is_charging(r.charge))
-        None => test.assert(false)
+        None    => test.assert(false)
     // Discharging, and a state of charge above 100.
     put(g, 0x16, 0xFFF0)
     put(g, 0x04, 0xFF00)
@@ -329,16 +337,16 @@ fn test_a_battery_reading_is_voltage_charge_and_direction() [io, hw]
         Some(r) =>
             test.assert(r.charge == ChargeState.ChargeIdle)
             test.assert_eq(r.percent ?? -1, 100)
-        None => test.assert(false)
+        None    => test.assert(false)
     // A rate of 0 is not charging.
     put(g, 0x16, 0x0000)
     match max17048.battery_read(g, W, 1)
         Some(r) => test.assert(r.charge == ChargeState.ChargeIdle)
-        None => test.assert(false)
+        None    => test.assert(false)
     // The MAX17049's pack voltage.
     match max17048.battery_read(g, W, 2)
         Some(r) => test.assert_eq(r.voltage.mv, 7200)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_reading_needs_all_three_registers() [io, hw]

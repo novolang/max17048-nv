@@ -52,7 +52,7 @@ fn digits(n: Int, width: Int) [hw]
             w = w + 1
     for _k in 0..19
         if div > 0
-            hal.uart.write_byte(48 + (n / div) % 10)
+            hal.uart.write_byte(48 + n / div % 10)
             div = div / 10
 
 // Writes a number of thousandths as `whole.fraction`, with a sign and
@@ -89,5 +89,5 @@ fn main() [hw]
                     Some(r) => thousandths(r)
                     None    => hal.uart.write("?")
                 hal.uart.write(" %/h\n")
-            None => hal.uart.write("no answer\n")
+            None    => hal.uart.write("no answer\n")
         hal.timer.delay_ms(1000)

@@ -360,7 +360,10 @@ pub fn battery_read<B: I2cBus>(bus: B, w: DeviceWiring, cells: Int) -> ?BatteryR
     var phase = ChargeState.ChargeIdle
     if rate > 0
         phase = ChargeState.ChargeConstantCurrent
-    Some(BatteryReading { voltage: MilliVolts { mv: mv }, current: MilliAmps { ma: 0 }, charge: phase, percent: Some(soc_percent(soc)) })
+    Some(BatteryReading { voltage: MilliVolts { mv: mv },
+        current: MilliAmps { ma: 0 },
+        charge: phase,
+        percent: Some(soc_percent(soc)) })
 
 // The VERSION word, or `None`.
 pub fn version_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
@@ -529,7 +532,8 @@ pub fn hibernating<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Bool [hw]
 // minutes, `act_mv` the cell voltage change that wakes it.  The part
 // reads and converts once in 45 seconds while it hibernates, against
 // 250 ms.
-pub fn set_hibernate<B: I2cBus>(bus: B, w: DeviceWiring, hib_milli_percent_per_hour: Int, act_mv: Int) -> Bool [hw]
+pub fn set_hibernate<B: I2cBus>(bus: B, w: DeviceWiring, hib_milli_percent_per_hour: Int,
+                                act_mv: Int) -> Bool [hw]
     write_word(bus, w, REG_HIBRT, hibrt_word(hib_milli_percent_per_hour, act_mv))
 
 // Disables hibernate mode (HIBRT = 0x0000).
@@ -607,7 +611,8 @@ pub fn rcomp_write<B: I2cBus>(bus: B, w: DeviceWiring, rcomp: Int) -> Bool [hw]
 // data sheet's formula (`rcomp_for`).  The data sheet asks the host to
 // do this "at least once per minute" while the temperature changes.
 // Answers the RCOMP written, or -1.
-pub fn compensate<B: I2cBus>(bus: B, w: DeviceWiring, temp_milli_c: Int, rcomp0: Int, temp_co_up: Int, temp_co_down: Int) -> Int [hw]
+pub fn compensate<B: I2cBus>(bus: B, w: DeviceWiring, temp_milli_c: Int, rcomp0: Int,
+                             temp_co_up: Int, temp_co_down: Int) -> Int [hw]
     let r = rcomp_for(temp_milli_c, rcomp0, temp_co_up, temp_co_down)
     if rcomp_write(bus, w, r)
         return r
