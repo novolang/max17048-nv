@@ -19,11 +19,13 @@ battery fuel gauges on an I2C bus.
   command the part does not acknowledge.
 - The RCOMP update against temperature, by the data sheet's formula.
 - The device program `examples/battery_monitor.nv`, a battery monitor. Built
-  for the nRF52840-DK it is 14,084 B of flash and for the nRF54LM20-DK
-  15,412 B.
-- Not verified on hardware: no board on the bench carries the chip. Neither
-  Nordic board has a driver for its two-wire interface (TWIM) at this
-  release, so the device program builds for them and finds an absent bus.
+  for the nRF52840-DK it is 18,144 B of flash and for the nRF54LM20-DK
+  19,504 B. When the package was written the two Nordic boards answered
+  for I2C as absent hardware and the images were 14,084 B and 15,412 B,
+  without the reading path; the TWIM drivers landed on 2026-11-10.
+- Not verified on hardware: no board on the bench carries the chip. A reply
+  from a MAX17048 over the Nordic boards' TWIM buses is NOT VERIFIED until
+  the driver rig.
 - Not implemented: loading the ModelGauge battery model into the TABLE
   registers, and the async form of `PowerManager`.
 - `novo pkg build --bin <name> --target=<board>` hands the board's slug to

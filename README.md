@@ -62,13 +62,20 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 14,084 B | 2,390 B | 2,644 B |
-| `nrf54lm20-dk` | 15,412 B | 2,710 B | 2,644 B |
+| `nrf52840-dk` | 18,144 B | 3,114 B | 3,236 B |
+| `nrf54lm20-dk` | 19,504 B | 3,454 B | 3,236 B |
 
 The numbers are from the build's memory report. Flash also holds the
 runtime, the compiler's support library and the program's tables. The
 arena, 65,536 B on both boards, is the runtime's heap and is reserved
-whether or not the program uses it. The program performs no I/O beyond
+whether or not the program uses it. The nRF52840-DK's bus is TWIM0 on
+SDA P0.26 and SCL P0.27, and the nRF54LM20-DK's is TWIM22 on SDA P1.03 and
+SCL P1.04 (`docs/hal/README.md` in the novo-lang repository, "The Nordic
+DKs' buses"), so both images carry the reading path. Before the Nordic
+buses landed on 2026-11-10 the two board packages answered for I2C as
+absent hardware, and the images were 14,084 B and 15,412 B of flash with
+2,644 B of RAM. A reply from a MAX17048 over those buses is NOT VERIFIED
+until the driver rig. The program performs no I/O beyond
 the board: its effect is `[hw]`, for the I2C bus, the UART and the timer.
 
 `BoardI2c` reaches the bus that the board's package names with
