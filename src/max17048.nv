@@ -1,0 +1,787 @@
+// max17048: Analog Devices' MAX17048 and MAX17049 battery fuel gauges on
+// an I2C bus.
+//
+// A fuel gauge reports how full a lithium cell is.  The part measures
+// the cell's voltage and runs Maxim's ModelGauge algorithm on it to
+// give the state of charge (SOC) in percent, and the rate at which the
+// charge changes (CRATE).  It has no current-sense resistor and
+// measures no current.  The facts below are from Maxim Integrated's
+// data sheet "MAX17048/MAX17049: 3uA 1-Cell/2-Cell Fuel Gauge with
+// ModelGauge", document 19-6171, Rev 7, 11/16.  The MAX17049 is the
+// same part for a pack of two cells in series: it has the same
+// register map, the same address and the same code, and its VCELL
+// register counts twice the voltage per step (`cells` = 2 below).
+//
+// A board's device table binds the part to this driver:
+//
+//     devices
+//         gauge  Max17048  from "max17048-nv"  on i2c0  addr 0x36  irq gauge_alrt
+//
+// and the board hands `attach` its I2C bus, its GPIO and the wiring.
+//
+// The bus (section "I2C Bus System").  The 7-bit address is fixed at
+// 0x36 (0x6C to write, 0x6D to read).  Every register is 16 bits wide,
+// the most significant byte at the even address, and "must be written
+// and read as 16-bit words; 8-bit writes cause no effect".  So every
+// transaction here moves two bytes.  A read is the register address,
+// a repeated start, and two bytes.
+//
+// The register map (Table 2).
+//
+//   address  register  LSb             access  power-up value
+//   0x02     VCELL     78.125 uV/cell  R       -
+//   0x04     SOC       1%/256          R       -
+//   0x06     MODE      -               W       0x0000
+//   0x08     VERSION   -               R       0x001_
+//   0x0A     HIBRT     -               R/W     0x8030
+//   0x0C     CONFIG    -               R/W     0x971C
+//   0x14     VALRT     -               R/W     0x00FF
+//   0x16     CRATE     0.208%/hr       R       -
+//   0x18     VRESET/ID -               R/W     0x96__
+//   0x1A     STATUS    -               R/W     0x01__
+//   0x40-7F  TABLE     -               W       the ModelGauge model
+//   0xFE     CMD       -               R/W     0xFFFF
+//
+// Drivers read for their fixes, nothing ported: Zephyr's
+// `drivers/fuel_gauge/max17048/max17048.c`, Adafruit's
+// `Adafruit_MAX1704X`, Linux's `drivers/power/supply/max17040_battery.c`
+// and eldruin's `max170xx` crate.  Each fix kept is named at its site.
+
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts, MilliAmps, RailState, ChargeState, BatteryReading, PowerManager }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers (Table 2).
+let REG_VCELL   = 0x02
+let REG_SOC     = 0x04
+let REG_MODE    = 0x06
+let REG_VERSION = 0x08
+let REG_HIBRT   = 0x0A
+let REG_CONFIG  = 0x0C
+let REG_VALRT   = 0x14
+let REG_CRATE   = 0x16
+let REG_VRESET  = 0x18
+let REG_STATUS  = 0x1A
+let REG_CMD     = 0xFE
+
+// MODE, as the 16-bit word (Figure 8): the flags are in the most
+// significant byte.
+let MODE_QUICK_START = 0x4000
+let MODE_EN_SLEEP    = 0x2000
+let MODE_HIB_STAT    = 0x1000
+
+// CONFIG, as the 16-bit word (Figure 10): RCOMP is the most significant
+// byte; the least significant holds SLEEP, ALSC, ALRT and ATHD.
+let CONFIG_RCOMP_MASK = 0xFF00
+let CONFIG_SLEEP      = 0x0080
+let CONFIG_ALSC       = 0x0040
+let CONFIG_ALRT       = 0x0020
+let CONFIG_ATHD_MASK  = 0x001F
+
+// STATUS, as the byte at 0x1A (Figure 13): the most significant byte of
+// the word holds the flags and EnVR, the least significant is not used.
+let STATUS_RI   = 0x01
+let STATUS_VH   = 0x02
+let STATUS_VL   = 0x04
+let STATUS_VR   = 0x08
+let STATUS_HD   = 0x10
+let STATUS_SC   = 0x20
+let STATUS_ENVR = 0x40
+// The five alert flags and the reset indicator: every flag, and not EnVR.
+let STATUS_FLAGS = 0x3F
+
+// The power-up values (Table 2).
+let CONFIG_RESET = 0x971C
+let HIBRT_RESET  = 0x8030
+let VALRT_RESET  = 0x00FF
+let RCOMP_RESET  = 0x97
+
+// The values of the identifying registers.  VERSION reads 0x001_ with
+// the low nibble the revision, so a part is a MAX1704x of this family
+// when the value masked with 0xFFF0 is 0x0010.
+let VERSION_MASK   = 0xFFF0
+let VERSION_FAMILY = 0x0010
+
+// The command that resets the part as if its power had been removed
+// (section "CMD Register (0xFE)").
+let CMD_POR = 0x5400
+
+// The first state of charge is available about one second after a
+// power-on reset (section "SOC Register (0x04)").
+let RESET_WAIT_US = 1000000
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+// The cell voltage a VCELL word holds, in microvolts.  One step is
+// 78.125 uV per cell (Table 2); `cells` is 1 for a MAX17048 and 2 for a
+// MAX17049, which reads the two cells in series as one voltage.
+//
+// Fix kept: the product is computed in a 64-bit integer.  Zephyr's
+// driver multiplies in 32 bits, which holds for a 16-bit word but would
+// not for a pack of two.
+//
+// ```novo
+// use max17048
+//
+// fn main() [io]
+//     println("${max17048.vcell_uv(0xB400, 1)}")   // 3600000
+// ```
+pub fn vcell_uv(raw: Int, cells: Int) -> Int
+    (raw & 0xFFFF) * 78125 * cells / 1000
+
+// The same voltage in millivolts, rounded to the nearest.
+//
+// ```novo
+// use max17048
+//
+// fn main() [io]
+//     println("${max17048.vcell_mv(0xB400, 1)}")   // 3600
+//     println("${max17048.vcell_mv(0xFFFF, 1)}")   // 5120
+//     println("${max17048.vcell_mv(0xB400, 2)}")   // 7200
+// ```
+pub fn vcell_mv(raw: Int, cells: Int) -> Int
+    ((raw & 0xFFFF) * 78125 * cells + 500000) / 1000000
+
+// The state of charge a SOC word holds, in thousandths of a percent.
+// The upper byte has units of 1% and the lower byte is the fraction in
+// 1/256 (Table 2), so 0x6400 is 100%.
+//
+// ```novo
+// use max17048
+//
+// fn main() [io]
+//     println("${max17048.soc_milli_percent(0x6400)}")   // 100000
+//     println("${max17048.soc_milli_percent(0x3280)}")   // 50500
+// ```
+pub fn soc_milli_percent(raw: Int) -> Int
+    (raw & 0xFFFF) * 1000 / 256
+
+// The whole percent of a SOC word, held to 100.
+//
+// The register can read above 100%: a full cell near its peak voltage
+// reports 100.x, and the word allows up to 255%.  Fix kept: Zephyr's
+// and Linux's drivers divide by 256 and report the result as it is;
+// `PowerManager` names 0 to 100, so the value is held to 100 here and
+// `soc_milli_percent` keeps the unclamped figure.
+pub fn soc_percent(raw: Int) -> Int
+    let p = (raw & 0xFFFF) >> 8
+    if p > 100
+        return 100
+    p
+
+// The charge rate a CRATE word holds, in thousandths of a percent of
+// the cell's capacity per hour: positive while charging, negative while
+// discharging.  One step is 0.208 %/hr (Table 2); the word is a signed
+// 16-bit number.
+//
+// Fix kept: Zephyr's driver multiplies the 16-bit value by 208 in a
+// 16-bit variable, which overflows beyond 157 steps (32.7 %/hr), and
+// Adafruit's and eldruin's drivers cast to a signed 16-bit value first,
+// as here.  The product is in a 64-bit integer.
+//
+// ```novo
+// use max17048
+//
+// fn main() [io]
+//     println("${max17048.crate_milli_percent_per_hour(0x0001)}")   // 208
+//     println("${max17048.crate_milli_percent_per_hour(0xFFFF)}")   // -208
+//     println("${max17048.crate_milli_percent_per_hour(0x8000)}")   // -6815744
+// ```
+pub fn crate_milli_percent_per_hour(raw: Int) -> Int
+    dev_bus.dev_sign_extend(raw, 16) * 208
+
+// The hibernate threshold HibThr, the most significant byte of HIBRT:
+// the charge rate below which the part enters hibernate mode, in
+// thousandths of a percent per hour.  One step is 0.208 %/hr.
+pub fn hib_thr_milli_percent_per_hour(hibrt: Int) -> Int
+    ((hibrt >> 8) & 0xFF) * 208
+
+// The active threshold ActThr, the least significant byte of HIBRT:
+// the cell voltage change from which the part leaves hibernate mode,
+// in millivolts.  One step is 1.25 mV.
+pub fn act_thr_mv(hibrt: Int) -> Int
+    (hibrt & 0xFF) * 5 / 4
+
+// The HIBRT word of a pair of thresholds: HibThr in the most
+// significant byte, as steps of 0.208 %/hr, and ActThr in the least, as
+// steps of 1.25 mV.  Each is held to its byte.
+pub fn hibrt_word(hib_milli_percent_per_hour: Int, act_mv: Int) -> Int
+    (clamp_byte(hib_milli_percent_per_hour / 208) << 8) | clamp_byte(act_mv * 4 / 5)
+
+// The lower alert threshold of a VALRT word in millivolts.  One step is
+// 20 mV for both thresholds (section "VALRT Register (0x14)").  The data
+// sheet gives no separate step for the MAX17049.
+pub fn valrt_min_mv(valrt: Int) -> Int
+    ((valrt >> 8) & 0xFF) * 20
+
+// The upper alert threshold of a VALRT word in millivolts.
+pub fn valrt_max_mv(valrt: Int) -> Int
+    (valrt & 0xFF) * 20
+
+// The VALRT word of a pair of thresholds in millivolts, each rounded to
+// the nearest 20 mV and held to 0 to 5100 mV.
+pub fn valrt_word(min_mv: Int, max_mv: Int) -> Int
+    (clamp_byte((min_mv + 10) / 20) << 8) | clamp_byte((max_mv + 10) / 20)
+
+// The reset threshold VRESET of the VRESET/ID word in millivolts: the
+// cell voltage below which the part resets itself.  The field is bits
+// 7 to 1 of the most significant byte, 40 mV a step (Figure 12); bit 0
+// is Dis.
+pub fn vreset_mv(word: Int) -> Int
+    (((word >> 8) & 0xFF) >> 1) * 40
+
+// The most significant byte of a VRESET/ID word for a threshold in
+// millivolts, rounded to the nearest 40 mV and held to the 7-bit field,
+// with the bit Dis `dis` (1 or 0).  The data sheet's configurable range
+// is 2.28 V to 3.48 V (Electrical Characteristics).
+pub fn vreset_byte(mv: Int, dis: Int) -> Int
+    let steps = (mv + 20) / 40
+    var s = steps
+    if s > 127
+        s = 127
+    if s < 0
+        s = 0
+    (s << 1) | (dis & 1)
+
+// The low-SOC alert threshold of a CONFIG word in percent.  ATHD is the
+// least significant five bits and the threshold is (32 - ATHD) percent
+// (section "CONFIG Register (0x0C)"): 0 is 32%, 31 is 1%.
+pub fn athd_percent(config: Int) -> Int
+    32 - (config & CONFIG_ATHD_MASK)
+
+// The RCOMP value for a battery temperature, by the data sheet's
+// formula (section "Temperature Compensation"):
+//
+//     if (T > 20) RCOMP = RCOMP0 + (T - 20) x TempCoUp
+//     else        RCOMP = RCOMP0 + (T - 20) x TempCoDown
+//
+// `temp_milli_c` is the battery temperature in thousandths of a degree
+// Celsius.  `rcomp0`, `temp_co_up` and `temp_co_down` are the
+// constants of the custom model: RCOMP0 is 0x97 by default, TempCoUp
+// -0.5 and TempCoDown -5.0, and here the two coefficients are in
+// thousandths, so -500 and -5000.  The data sheet gives no rounding
+// rule; the adjustment is truncated toward zero.  RCOMP is an 8-bit
+// field, so the result is held to 0 to 255.
+//
+// ```novo
+// use max17048
+//
+// fn main() [io]
+//     // 30 C: 0x97 + 10 x -0.5 = 146 = 0x92.
+//     println("${max17048.rcomp_for(30000, 0x97, -500, -5000)}")   // 146
+//     // 0 C: 0x97 + (-20) x -5.0 = 251 = 0xFB.
+//     println("${max17048.rcomp_for(0, 0x97, -500, -5000)}")       // 251
+// ```
+pub fn rcomp_for(temp_milli_c: Int, rcomp0: Int, temp_co_up: Int, temp_co_down: Int) -> Int
+    let delta = temp_milli_c - 20000
+    var co = temp_co_down
+    if delta > 0
+        co = temp_co_up
+    let adj = delta * co / 1000000
+    let v = rcomp0 + adj
+    clamp_byte(v)
+
+// `v` held to the range of a byte, 0 to 255.
+fn clamp_byte(v: Int) -> Int
+    if v < 0
+        return 0
+    if v > 255
+        return 255
+    v
+
+// ── Register access, over any I2C bus ────────────────────────────────
+//
+// The functions below take the bus as a type parameter, so the same
+// code runs on a board's bus and on a test's double.  Each answers
+// `None`, `false` or -1 when the part does not acknowledge.
+
+// A register as a 16-bit word, its first byte the most significant.
+pub fn read_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not dev_bus.wiring_read_into(bus, w, reg, 2, var b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// Writes a register as a 16-bit word, the most significant byte first.
+// Fix kept: a register is always written as the two bytes of a word,
+// as the data sheet requires ("8-bit writes cause no effect").
+// Adafruit's driver writes the thresholds of VALRT and HIBRT as single
+// bytes, which the part ignores.
+pub fn write_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, word: Int) -> Bool [hw]
+    var b: DevBytes = Vec.new()
+    let _ = b.push(((word >> 8) & 0xFF) as u8)
+    let _ = b.push((word & 0xFF) as u8)
+    dev_bus.wiring_write_from(bus, w, reg, b)
+
+// Reads a register, clears the bits of `clear`, sets those of `set`,
+// and writes it back.  Answers the word written, or -1.
+//
+// Fix kept: a register that holds several settings is read from the
+// part and written whole, as Linux's driver does for RCOMP and ATHD
+// with a masked update, so one setting does not undo another.
+pub fn update_word<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, clear: Int, set: Int) -> Int [hw]
+    let Some(old) = read_word(bus, w, reg) else return -1
+    let next = (old & (0xFFFF ^ clear)) | set
+    if write_word(bus, w, reg, next)
+        return next
+    -1
+
+// The cell voltage in millivolts, for a part of `cells` cells.
+pub fn voltage_mv<B: I2cBus>(bus: B, w: DeviceWiring, cells: Int) -> ?Int [hw]
+    let Some(raw) = read_word(bus, w, REG_VCELL) else return None
+    Some(vcell_mv(raw, cells))
+
+// The state of charge in thousandths of a percent.
+pub fn soc_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(raw) = read_word(bus, w, REG_SOC) else return None
+    Some(soc_milli_percent(raw))
+
+// The charge rate in thousandths of a percent per hour, signed.
+pub fn crate_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(raw) = read_word(bus, w, REG_CRATE) else return None
+    Some(crate_milli_percent_per_hour(raw))
+
+// The measurement `PowerManager.battery` answers: the voltage, the state
+// of charge and the direction of the charge rate, in three register
+// reads.  The part has no current measurement, so the current is 0; it
+// does not know the phase of a charger, so a positive rate answers
+// `ChargeConstantCurrent`, the phase `dev_power.power_is_charging`
+// counts first, and any other rate `ChargeIdle`.  `None` when the part
+// does not acknowledge any of the three reads.
+//
+// The three registers are not latched together, so the three values
+// can come from two different updates of the part, which are 250 ms
+// apart in active mode.
+pub fn battery_read<B: I2cBus>(bus: B, w: DeviceWiring, cells: Int) -> ?BatteryReading [hw]
+    let Some(mv) = voltage_mv(bus, w, cells) else return None
+    let Some(soc) = read_word(bus, w, REG_SOC) else return None
+    let Some(rate) = crate_read(bus, w) else return None
+    var phase = ChargeState.ChargeIdle
+    if rate > 0
+        phase = ChargeState.ChargeConstantCurrent
+    Some(BatteryReading { voltage: MilliVolts { mv: mv }, current: MilliAmps { ma: 0 }, charge: phase, percent: Some(soc_percent(soc)) })
+
+// The VERSION word, or `None`.
+pub fn version_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    read_word(bus, w, REG_VERSION)
+
+// What the part says it is: `who` is the VERSION word masked with
+// 0xFFF0, 0x0010 for the MAX17048 and MAX17049, and `rev` the low
+// nibble.  `None` when the part does not acknowledge or answers another
+// family.  Fix kept: the same mask as Zephyr's and Adafruit's drivers,
+// since the low nibble is the production version.
+pub fn identify<B: I2cBus>(bus: B, w: DeviceWiring) -> ?DeviceId [hw]
+    let Some(v) = version_read(bus, w) else return None
+    if (v & VERSION_MASK) != VERSION_FAMILY
+        return None
+    Some(DeviceId { who: v & VERSION_MASK, rev: Some(v & 0x000F) })
+
+// Whether the part answers as a MAX17048 or MAX17049.  Nothing is
+// written: unlike Adafruit's `begin`, which resets the part, this
+// leaves the gauge's state alone, since a reset restarts the
+// fuel-gauge calculation and "should only be used when the battery is
+// fully relaxed" (section "Power-On Reset (POR)").
+pub fn start<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    identify(bus, w) != None
+
+// The one-time factory identifier, the least significant byte of the
+// VRESET/ID word (Figure 12), or `None`.
+pub fn chip_id<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(v) = read_word(bus, w, REG_VRESET) else return None
+    Some(v & 0xFF)
+
+// ── Status and alerts ────────────────────────────────────────────────
+
+// The STATUS flags as a byte: the bits `STATUS_RI`, `STATUS_VH`,
+// `STATUS_VL`, `STATUS_VR`, `STATUS_HD` and `STATUS_SC`, with
+// `STATUS_ENVR` for the enable bit of the reset alert.  `None` when the
+// part does not acknowledge.
+pub fn status_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(v) = read_word(bus, w, REG_STATUS) else return None
+    Some((v >> 8) & 0xFF)
+
+// Clears the flags of `flags` in STATUS, a mask of the `STATUS_*` flag
+// bits, and leaves EnVR as it is.  Answers whether the part took the
+// write.
+//
+// Fix kept: the flags are cleared by writing the 16-bit word back with
+// the bits at 0 ("clear the corresponding bit after servicing the
+// alert"), and the other bits are written as they were read, so EnVR
+// is not undone.  Adafruit's driver clears a bit by writing back the
+// status byte it read.
+pub fn status_clear<B: I2cBus>(bus: B, w: DeviceWiring, flags: Int) -> Bool [hw]
+    update_word(bus, w, REG_STATUS, (flags & STATUS_FLAGS) << 8, 0) >= 0
+
+// Releases the ALRT pin by clearing CONFIG.ALRT.  The pin stays low
+// until software writes it, and a pin cleared while a flag of STATUS is
+// still set can be raised again by the part, so `alert_service` clears
+// the flags first.
+pub fn alert_pin_clear<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    update_word(bus, w, REG_CONFIG, CONFIG_ALRT, 0) >= 0
+
+// Services an alert: clears the flags of `flags` and then releases the
+// ALRT pin.  Answers the flags that were set before it cleared them, or
+// -1 when the part does not acknowledge.
+pub fn alert_service<B: I2cBus>(bus: B, w: DeviceWiring, flags: Int) -> Int [hw]
+    let Some(was) = status_read(bus, w) else return -1
+    if not status_clear(bus, w, flags)
+        return -1
+    if not alert_pin_clear(bus, w)
+        return -1
+    was & STATUS_FLAGS
+
+// Whether CONFIG.ALRT is set, which is to say the part is holding the
+// ALRT pin low for an alert.
+pub fn alert_active<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Bool [hw]
+    let Some(c) = read_word(bus, w, REG_CONFIG) else return None
+    Some((c & CONFIG_ALRT) != 0)
+
+// Whether the reset indicator is set: the part has powered up or been
+// reset and "is not configured, so the model should be loaded and the
+// bit should be cleared" (section "STATUS Register (0x1A)").  `None`
+// when the part does not acknowledge.
+pub fn reset_indicator<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Bool [hw]
+    let Some(s) = status_read(bus, w) else return None
+    Some((s & STATUS_RI) != 0)
+
+// Sets the low-SOC alert threshold to `percent`, 1 to 32.  Answers
+// whether the part took it; false for a value outside 1 to 32, as
+// Linux's driver refuses one.  The alert occurs "only on a falling
+// edge past this threshold".
+pub fn set_soc_alert<B: I2cBus>(bus: B, w: DeviceWiring, percent: Int) -> Bool [hw]
+    if percent < 1 or percent > 32
+        return false
+    update_word(bus, w, REG_CONFIG, CONFIG_ATHD_MASK, 32 - percent) >= 0
+
+// The low-SOC alert threshold in percent, or `None`.
+pub fn soc_alert<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(c) = read_word(bus, w, REG_CONFIG) else return None
+    Some(athd_percent(c))
+
+// Turns the alert on a 1% change of SOC on or off (CONFIG.ALSC).
+pub fn set_soc_change_alert<B: I2cBus>(bus: B, w: DeviceWiring, on: Bool) -> Bool [hw]
+    if on
+        return update_word(bus, w, REG_CONFIG, 0, CONFIG_ALSC) >= 0
+    update_word(bus, w, REG_CONFIG, CONFIG_ALSC, 0) >= 0
+
+// Sets the cell voltage window outside which the part raises the
+// alerts VL and VH, in millivolts.  The write is refused when the
+// minimum is above the maximum.
+pub fn set_voltage_alert<B: I2cBus>(bus: B, w: DeviceWiring, min_mv: Int, max_mv: Int) -> Bool [hw]
+    if min_mv > max_mv
+        return false
+    write_word(bus, w, REG_VALRT, valrt_word(min_mv, max_mv))
+
+// The VALRT word, or `None`; `valrt_min_mv` and `valrt_max_mv` give the
+// window it holds in millivolts.
+pub fn voltage_alert<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    read_word(bus, w, REG_VALRT)
+
+// Sets the cell voltage below which the part resets itself, in
+// millivolts, keeping the Dis bit and leaving the identifier alone.
+// The data sheet says "for captive batteries, set to 2.5V; for
+// removable batteries, set to at least 300 mV below the application's
+// empty voltage".
+pub fn set_reset_voltage<B: I2cBus>(bus: B, w: DeviceWiring, mv: Int) -> Bool [hw]
+    let Some(old) = read_word(bus, w, REG_VRESET) else return false
+    let b = vreset_byte(mv, old >> 8)
+    write_word(bus, w, REG_VRESET, (b << 8) | (old & 0xFF))
+
+// The reset voltage in millivolts, or `None`.
+pub fn reset_voltage<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(v) = read_word(bus, w, REG_VRESET) else return None
+    Some(vreset_mv(v))
+
+// Turns the alert that follows a voltage reset on or off (STATUS.EnVR).
+pub fn set_reset_alert<B: I2cBus>(bus: B, w: DeviceWiring, on: Bool) -> Bool [hw]
+    if on
+        return update_word(bus, w, REG_STATUS, 0, STATUS_ENVR << 8) >= 0
+    update_word(bus, w, REG_STATUS, STATUS_ENVR << 8, 0) >= 0
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+// Starts a quick start: the part restarts its fuel-gauge calculation
+// from the voltage it measures now, as at power-up.  Answers the time
+// in microseconds to wait for the new state of charge, or -1.
+//
+// Use it with care.  The data sheet: "most systems should not use
+// quick-start because the ICs handle most startup problems
+// transparently"; the voltage must be close to the cell's open-circuit
+// voltage, so a cell under load or just off a charger reads wrong.
+//
+// MODE is listed as write-only.  The command is written with EnSleep
+// as the part reads it back, as Adafruit's driver does with a masked
+// write, so a quick start does not clear the sleep enable.
+pub fn quick_start<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    let Some(mode) = read_word(bus, w, REG_MODE) else return -1
+    if write_word(bus, w, REG_MODE, MODE_QUICK_START | (mode & MODE_EN_SLEEP))
+        return RESET_WAIT_US
+    -1
+
+// Whether the part is in hibernate mode (MODE.HibStat), or `None`.
+pub fn hibernating<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Bool [hw]
+    let Some(mode) = read_word(bus, w, REG_MODE) else return None
+    Some((mode & MODE_HIB_STAT) != 0)
+
+// Sets the hibernate thresholds.  `hib_milli_percent_per_hour` is the
+// charge rate below which the part enters hibernate mode after six
+// minutes, `act_mv` the cell voltage change that wakes it.  The part
+// reads and converts once in 45 seconds while it hibernates, against
+// 250 ms.
+pub fn set_hibernate<B: I2cBus>(bus: B, w: DeviceWiring, hib_milli_percent_per_hour: Int, act_mv: Int) -> Bool [hw]
+    write_word(bus, w, REG_HIBRT, hibrt_word(hib_milli_percent_per_hour, act_mv))
+
+// Disables hibernate mode (HIBRT = 0x0000).
+pub fn hibernate_never<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    write_word(bus, w, REG_HIBRT, 0x0000)
+
+// Keeps the part always in hibernate mode (HIBRT = 0xFFFF).  The data
+// sheet advises it only for loads below a C/4 rate.
+pub fn hibernate_always<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    write_word(bus, w, REG_HIBRT, 0xFFFF)
+
+// The HIBRT word, or `None`.
+pub fn hibrt_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    read_word(bus, w, REG_HIBRT)
+
+// Allows the sleep mode (MODE.EnSleep) or forbids it.  CONFIG.SLEEP has
+// no effect until this is set.
+pub fn set_sleep_enable<B: I2cBus>(bus: B, w: DeviceWiring, on: Bool) -> Bool [hw]
+    var mode = 0
+    if on
+        mode = MODE_EN_SLEEP
+    write_word(bus, w, REG_MODE, mode)
+
+// Puts the part to sleep: it halts all operations and draws under 1 uA.
+// Needs `set_sleep_enable(true)` first.  The part does not see the
+// cell change in this state, so wake it before charging or
+// discharging (section "Sleep Mode").  Answers whether the part took
+// the write.
+pub fn sleep<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    update_word(bus, w, REG_CONFIG, 0, CONFIG_SLEEP) >= 0
+
+// Wakes the part: CONFIG.SLEEP = 0.  "Other communication does not wake
+// up the IC."
+pub fn wake<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    update_word(bus, w, REG_CONFIG, CONFIG_SLEEP, 0) >= 0
+
+// Resets the part as if its power had been removed: the command 0x5400
+// to CMD.  Every register returns to its power-up value, so the
+// ModelGauge model, if one was loaded, is lost and must be loaded
+// again.  The reset includes a quick start, so use it only when the
+// cell is relaxed.
+//
+// Fix kept: the part resets when the last bit is clocked in and does
+// not acknowledge the command, so a refused write is the expected
+// answer.  Adafruit's `reset` treats the NACK as success and
+// eldruin's treats it as an error.  Here the part is first read, to
+// know it is there, and the write's answer is not read; the caller
+// then waits the time answered and checks `reset_indicator`.  Answers
+// the time to wait in microseconds, one second for the first state of
+// charge, or -1 when the part did not answer before the command.
+pub fn reset<B: I2cBus>(bus: B, w: DeviceWiring) -> Int [hw]
+    if version_read(bus, w) == None
+        return -1
+    let _ = write_word(bus, w, REG_CMD, CMD_POR)
+    RESET_WAIT_US
+
+// ── The ModelGauge compensation ──────────────────────────────────────
+
+// The RCOMP byte of CONFIG, or `None`.
+pub fn rcomp_read<B: I2cBus>(bus: B, w: DeviceWiring) -> ?Int [hw]
+    let Some(c) = read_word(bus, w, REG_CONFIG) else return None
+    Some((c >> 8) & 0xFF)
+
+// Writes RCOMP, leaving the rest of CONFIG as it is.  Answers whether
+// the part took it.
+//
+// Fix kept: the least significant byte of CONFIG, which holds SLEEP,
+// ALSC, ALRT and ATHD, is read and written back unchanged, as Linux's
+// `max17040_set_rcomp` does with a mask of 0xFF00.  A write of RCOMP
+// alone as a word would reset the alert threshold to 0, which is 32%.
+pub fn rcomp_write<B: I2cBus>(bus: B, w: DeviceWiring, rcomp: Int) -> Bool [hw]
+    update_word(bus, w, REG_CONFIG, CONFIG_RCOMP_MASK, (rcomp & 0xFF) << 8) >= 0
+
+// Updates RCOMP for the battery temperature `temp_milli_c`, by the
+// data sheet's formula (`rcomp_for`).  The data sheet asks the host to
+// do this "at least once per minute" while the temperature changes.
+// Answers the RCOMP written, or -1.
+pub fn compensate<B: I2cBus>(bus: B, w: DeviceWiring, temp_milli_c: Int, rcomp0: Int, temp_co_up: Int, temp_co_down: Int) -> Int [hw]
+    let r = rcomp_for(temp_milli_c, rcomp0, temp_co_up, temp_co_down)
+    if rcomp_write(bus, w, r)
+        return r
+    -1
+
+// The level of the ALRT line, 0 or 1, and -1 when the wiring has no
+// interrupt pin.  The line is active low.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// ── The part on a board ──────────────────────────────────────────────
+
+// A MAX17048 on a board's I2C bus at the address `w.addr`, 0x36.
+pub @value
+struct Max17048
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+// A MAX17049: the same part for two cells in series.  Its VCELL word
+// counts twice the voltage per step, and it is otherwise the same
+// driver.
+pub @value
+struct Max17049
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Max17048
+    // The part at `w.addr` on the board's bus, as the board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Max17048
+        Max17048 { bus: bus, pins: pins, w: w }
+
+    // Whether the part answers as a MAX17048 or MAX17049; nothing is
+    // written.
+    fn begin(self) -> Bool [hw]
+        start(self.bus, self.w)
+
+    // The state of charge in thousandths of a percent, or `None`.
+    fn soc_milli_percent(self) -> ?Int [hw]
+        soc_read(self.bus, self.w)
+
+    // The charge rate in thousandths of a percent per hour, positive
+    // while charging, or `None`.
+    fn charge_rate(self) -> ?Int [hw]
+        crate_read(self.bus, self.w)
+
+    // The STATUS flags, or `None`.
+    fn status(self) -> ?Int [hw]
+        status_read(self.bus, self.w)
+
+    // Clears the flags of `flags` and releases the ALRT pin; answers the
+    // flags that were set, or -1.
+    fn alert_service(self, flags: Int) -> Int [hw]
+        alert_service(self.bus, self.w, flags)
+
+    // The level of the ALRT line, 0 when it is asserted, -1 when the
+    // wiring has no interrupt pin.
+    fn alert_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    // Sets the low-SOC alert threshold, 1 to 32 percent.
+    fn set_soc_alert(self, percent: Int) -> Bool [hw]
+        set_soc_alert(self.bus, self.w, percent)
+
+    // Sets the cell voltage window of the alerts VL and VH.
+    fn set_voltage_alert(self, min_mv: Int, max_mv: Int) -> Bool [hw]
+        set_voltage_alert(self.bus, self.w, min_mv, max_mv)
+
+    // Starts a quick start; answers the time to wait, or -1.
+    fn quick_start(self) -> Int [hw]
+        quick_start(self.bus, self.w)
+
+    // Sets the hibernate thresholds.
+    fn set_hibernate(self, hib_milli_percent_per_hour: Int, act_mv: Int) -> Bool [hw]
+        set_hibernate(self.bus, self.w, hib_milli_percent_per_hour, act_mv)
+
+    // Puts the part to sleep, after allowing it.
+    fn sleep(self) -> Bool [hw]
+        set_sleep_enable(self.bus, self.w, true) and sleep(self.bus, self.w)
+
+    // Wakes the part.
+    fn wake(self) -> Bool [hw]
+        wake(self.bus, self.w)
+
+    // Resets the part; answers the time to wait, or -1.
+    fn reset(self) -> Int [hw]
+        reset(self.bus, self.w)
+
+    // Updates RCOMP for the battery temperature in thousandths of a
+    // degree Celsius, with the default model constants; answers the
+    // RCOMP written, or -1.
+    fn compensate(self, temp_milli_c: Int) -> Int [hw]
+        compensate(self.bus, self.w, temp_milli_c, RCOMP_RESET, -500, -5000)
+
+impl PowerManager[hw] for Max17048
+    // The part supplies no rail.
+    fn rail_count(self) -> Int [hw]
+        0
+
+    // A rail the part does not have is off.
+    fn rail_state(self, rail: Int) -> RailState [hw]
+        RailState.RailOff
+
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts [hw]
+        None
+
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts [hw]
+        None
+
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool [hw]
+        false
+
+    // The cell voltage, the state of charge and the charge direction;
+    // the current is 0 because the part does not measure one.
+    fn battery(self) -> ?BatteryReading [hw]
+        battery_read(self.bus, self.w, 1)
+
+impl Identifiable[hw] for Max17048
+    // The VERSION word masked with 0xFFF0, with the low nibble as the
+    // revision.
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.bus, self.w)
+
+impl Max17049
+    // The part at `w.addr` on the board's bus, as the board's device
+    // table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring) -> Max17049
+        Max17049 { bus: bus, pins: pins, w: w }
+
+    // Whether the part answers as a MAX17048 or MAX17049; nothing is
+    // written.
+    fn begin(self) -> Bool [hw]
+        start(self.bus, self.w)
+
+    // The state of charge in thousandths of a percent, or `None`.
+    fn soc_milli_percent(self) -> ?Int [hw]
+        soc_read(self.bus, self.w)
+
+    // The charge rate in thousandths of a percent per hour, or `None`.
+    fn charge_rate(self) -> ?Int [hw]
+        crate_read(self.bus, self.w)
+
+    // Resets the part; answers the time to wait, or -1.
+    fn reset(self) -> Int [hw]
+        reset(self.bus, self.w)
+
+    // Updates RCOMP for the battery temperature, as for a MAX17048.
+    fn compensate(self, temp_milli_c: Int) -> Int [hw]
+        compensate(self.bus, self.w, temp_milli_c, RCOMP_RESET, -500, -5000)
+
+impl PowerManager[hw] for Max17049
+    fn rail_count(self) -> Int [hw]
+        0
+
+    fn rail_state(self, rail: Int) -> RailState [hw]
+        RailState.RailOff
+
+    fn rail_voltage(self, rail: Int) -> ?MilliVolts [hw]
+        None
+
+    fn rail_set_voltage(self, rail: Int, v: MilliVolts) -> ?MilliVolts [hw]
+        None
+
+    fn rail_enable(self, rail: Int, on: Bool) -> Bool [hw]
+        false
+
+    // The voltage of the two cells in series, the state of charge and
+    // the charge direction.
+    fn battery(self) -> ?BatteryReading [hw]
+        battery_read(self.bus, self.w, 2)
+
+impl Identifiable[hw] for Max17049
+    fn device_id(self) -> ?DeviceId [hw]
+        identify(self.bus, self.w)

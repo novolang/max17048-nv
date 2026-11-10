@@ -1,0 +1,93 @@
+/* battery_monitor.nv: a battery monitor that prints the cell voltage,
+ * the state of charge and the charge rate of a lithium cell once a
+ * second
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          max17048-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The gauge is a MAX17048 on the board's first I2C bus at its fixed
+ * address, 0x36, wired as an Adafruit MAX17048 breakout wires it: SDA and
+ * SCL to the bus, the cell on the breakout's battery connector, and
+ * ALRT to a pin the program does not read.  A line looks like
+ *
+ *     cell 3874 mV  charge 87.500 %  rate -1.248 %/h
+ *
+ * The program reads the cell through devices-nv's PowerManager trait,
+ * `battery`, which answers the voltage in millivolts and the whole
+ * percent, and it asks the driver for the two figures the trait has no
+ * place for: the charge in thousandths of a percent and the rate in
+ * thousandths of a percent per hour.  A negative rate means the cell
+ * is discharging.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.  It allocates nothing after it starts.
+ *
+ * Boards: the nRF52840-DK and the nRF54LM20-DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints
+ * "no answer" until a board package names one with `@hal(i2c)`.  The
+ * gauge has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_power.{ PowerManager }
+use dev_bus
+use max17048.{ Max17048 }
+
+// Writes `n`, 0 or more, in decimal, with at least `width` digits.
+// Formatting into a string would allocate, which @tier(embedded)
+// refuses, so each digit goes out as a byte.  An Int has at most 19
+// decimal digits, which bounds both loops.
+@tier(embedded)
+fn digits(n: Int, width: Int) [hw]
+    var div = 1
+    var w = 1
+    for _k in 0..18
+        if div <= n / 10 or w < width
+            div = div * 10
+            w = w + 1
+    for _k in 0..19
+        if div > 0
+            hal.uart.write_byte(48 + (n / div) % 10)
+            div = div / 10
+
+// Writes a number of thousandths as `whole.fraction`, with a sign and
+// three decimals.
+@tier(embedded)
+fn thousandths(n: Int) [hw]
+    var m = n
+    if m < 0
+        hal.uart.write("-")
+        m = 0 - m
+    digits(m / 1000, 1)
+    hal.uart.write(".")
+    digits(m % 1000, 3)
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    // The gauge is not in the board's device table, so the program builds
+    // it from the first bus; the address is the part's own.
+    let gauge = Max17048.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, 0x36))
+    if not gauge.begin()
+        hal.uart.write("no answer from the gauge at 0x36\n")
+    while true
+        match gauge.battery()
+            Some(b) =>
+                hal.uart.write("cell ")
+                digits(b.voltage.mv, 1)
+                hal.uart.write(" mV  charge ")
+                match gauge.soc_milli_percent()
+                    Some(s) => thousandths(s)
+                    None    => hal.uart.write("?")
+                hal.uart.write(" %  rate ")
+                match gauge.charge_rate()
+                    Some(r) => thousandths(r)
+                    None    => hal.uart.write("?")
+                hal.uart.write(" %/h\n")
+            None => hal.uart.write("no answer\n")
+        hal.timer.delay_ms(1000)

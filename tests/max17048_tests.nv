@@ -1,0 +1,701 @@
+// max17048_tests: the driver over a double of the part, on the host.
+//
+// The double is a MAX17048 at 0x36 with a register file of bytes.  It
+// does what the data sheet says the part does on the bus:
+//
+//   - a register is a 16-bit word, the most significant byte at the even
+//     address, and a write of one byte has no effect ("8-bit writes cause
+//     no effect");
+//   - the quick-start bit of MODE clears itself;
+//   - the command 0x5400 to CMD resets every register to its power-up
+//     value, and the part does not acknowledge it.
+//
+// It records every write as `register, count, bytes...` in `log`, so a
+// test reads back what the driver sent, and it can refuse the reads or
+// the writes of chosen registers, to run the paths of a part that stops
+// answering.  The type `Max17048` holds the board's bus handles; its
+// methods are run here over the host's handles, which are absent
+// hardware, so each answers as for a part that does not acknowledge.
+//
+// The numbers are the data sheet's: Table 2 (the registers, their
+// power-up values and their steps), the HIBRT, VALRT and VRESET/ID
+// descriptions and the temperature-compensation formula, document
+// 19-6171 Rev 7.
+
+use std.test
+use embedded_hal.{ I2cBus, GpioOut, BoardI2c, BoardGpio }
+use dev_bus.{ DeviceWiring }
+use dev_power.{ MilliVolts, ChargeState, RailState, PowerManager }
+use dev_id.{ Identifiable }
+use max17048
+use max17048.{ Max17048, Max17049 }
+
+struct FakeGauge
+    regs: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    deaf: HashMap<Int, Int>
+    mute: HashMap<Int, Int>
+    here: Int
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// Appends `v` to the log, a map from the position to the value whose
+// key -1 holds the length.  A trait method's receiver is a plain
+// `self`, which cannot append to a list field, and a map takes the
+// write.
+fn log_push(m: HashMap<Int, Int>, v: Int)
+    let n = at(m, -1)
+    m.insert(n, v)
+    m.insert(-1, n + 1)
+
+// The register file at its power-up values (Table 2): VERSION 0x0012,
+// HIBRT 0x8030, CONFIG 0x971C, VALRT 0x00FF, VRESET/ID 0x965A and
+// STATUS 0x0100, whose RI is set.  The ID byte is the factory's.
+fn power_up(g: FakeGauge)
+    g.regs.clear()
+    put(g, 0x08, 0x0012)
+    put(g, 0x0A, 0x8030)
+    put(g, 0x0C, 0x971C)
+    put(g, 0x14, 0x00FF)
+    put(g, 0x18, 0x965A)
+    put(g, 0x1A, 0x0100)
+
+fn put(g: FakeGauge, reg: Int, word: Int)
+    g.regs.insert(reg, (word >> 8) & 0xFF)
+    g.regs.insert(reg + 1, word & 0xFF)
+
+fn word(g: FakeGauge, reg: Int) -> Int
+    (at(g.regs, reg) << 8) | at(g.regs, reg + 1)
+
+impl I2cBus for FakeGauge
+    fn init(self, freq: Int) [hw]
+        pass
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if addr != self.here or data.len() == 0
+            return false
+        let reg = data[0] as Int
+        log_push(self.log, reg)
+        log_push(self.log, data.len() - 1)
+        for i in 1..data.len()
+            log_push(self.log, data[i] as Int)
+        if at(self.mute, reg) != 0
+            return false
+        if data.len() != 3
+            return true
+        let w = ((data[1] as Int) << 8) | (data[2] as Int)
+        if reg == 0xFE
+            if w == 0x5400
+                power_up(self)
+            return false
+        var stored = w
+        if reg == 0x06
+            stored = w & 0xBFFF
+        put(self, reg, stored)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        if addr != self.here
+            return None
+        let reg = tx[0] as Int
+        if at(self.deaf, reg) != 0
+            return None
+        var out: [u8] = []
+        for i in 0..n
+            list.push(out, at(self.regs, reg + i) as u8)
+        Some(out)
+
+struct FakePins
+    levels: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        pass
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+// A gauge at its power-up values.
+fn gauge() -> FakeGauge
+    let g = FakeGauge { regs: HashMap.new(), log: HashMap.new(), deaf: HashMap.new(), mute: HashMap.new(), here: 0x36 }
+    power_up(g)
+    g
+
+// Nothing at the part's address.
+fn absent() -> FakeGauge
+    FakeGauge { regs: HashMap.new(), log: HashMap.new(), deaf: HashMap.new(), mute: HashMap.new(), here: 0x37 }
+
+let W = dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x36), 7)
+
+fn nothing(g: FakeGauge)
+    g.log.clear()
+
+// Every write the driver sent is the register, the count 2 and the two
+// bytes of a word.
+fn all_writes_are_words(g: FakeGauge) -> Bool
+    var i = 0
+    while i < at(g.log, -1)
+        if at(g.log, i + 1) != 2
+            return false
+        i = i + 4
+    true
+
+// ── The steps of the registers ───────────────────────────────────────
+
+@test
+fn test_vcell_is_78_125_microvolts_a_step() [io]
+    // Table 2: 78.125 uV/cell.  0xB400 is 46080 steps, 3.6 V.
+    test.assert_eq(max17048.vcell_uv(0xB400, 1), 3600000)
+    test.assert_eq(max17048.vcell_mv(0xB400, 1), 3600)
+    // One step is 78 uV when truncated, and 0 mV rounded.
+    test.assert_eq(max17048.vcell_uv(1, 1), 78)
+    test.assert_eq(max17048.vcell_mv(1, 1), 0)
+    // 12.8 steps make 1 mV, so 7 steps round up to 1 mV and 6 round down to 0.
+    test.assert_eq(max17048.vcell_mv(13, 1), 1)
+    test.assert_eq(max17048.vcell_mv(6, 1), 0)
+    test.assert_eq(max17048.vcell_mv(7, 1), 1)
+    // The largest word is 65535 steps, 5.1199 V.
+    test.assert_eq(max17048.vcell_uv(0xFFFF, 1), 5119921)
+    test.assert_eq(max17048.vcell_mv(0xFFFF, 1), 5120)
+    test.assert_eq(max17048.vcell_mv(0x0000, 1), 0)
+    // A word wider than 16 bits is cut to 16.
+    test.assert_eq(max17048.vcell_mv(0x1B400, 1), 3600)
+
+@test
+fn test_the_max17049_counts_two_cells_a_step() [io]
+    // The MAX17049 measures the pack of two cells in series.
+    test.assert_eq(max17048.vcell_mv(0xB400, 2), 7200)
+    test.assert_eq(max17048.vcell_uv(0xB400, 2), 7200000)
+
+@test
+fn test_soc_is_one_256th_of_a_percent_a_step() [io]
+    // Table 2: 1%/256.  The upper byte is whole percent.
+    test.assert_eq(max17048.soc_milli_percent(0x6400), 100000)
+    test.assert_eq(max17048.soc_milli_percent(0x3280), 50500)
+    test.assert_eq(max17048.soc_milli_percent(0x0100), 1000)
+    test.assert_eq(max17048.soc_milli_percent(0x0001), 3)
+    test.assert_eq(max17048.soc_milli_percent(0x0000), 0)
+    test.assert_eq(max17048.soc_percent(0x6400), 100)
+    test.assert_eq(max17048.soc_percent(0x3280), 50)
+    test.assert_eq(max17048.soc_percent(0x00FF), 0)
+    // The register can read above 100%; the percent is held at 100 and the
+    // milli-percent is not.
+    test.assert_eq(max17048.soc_percent(0x6500), 100)
+    test.assert_eq(max17048.soc_percent(0xFF00), 100)
+    test.assert_eq(max17048.soc_milli_percent(0xFF00), 255000)
+
+@test
+fn test_crate_is_signed_and_0_208_percent_an_hour_a_step() [io]
+    // Table 2: 0.208%/hr.
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0x0001), 208)
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0xFFFF), -208)
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0x0000), 0)
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0x7FFF), 6815536)
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0x8000), -6815744)
+    // 158 steps is 32.864 %/hr, past what a 16-bit product holds.
+    test.assert_eq(max17048.crate_milli_percent_per_hour(158), 32864)
+    test.assert_eq(max17048.crate_milli_percent_per_hour(0xFF62), -32864)
+
+@test
+fn test_hibrt_holds_two_thresholds() [io]
+    // The power-up value 0x8030: HibThr 128 steps of 0.208 %/hr, ActThr 48
+    // steps of 1.25 mV.
+    test.assert_eq(max17048.hib_thr_milli_percent_per_hour(0x8030), 26624)
+    test.assert_eq(max17048.act_thr_mv(0x8030), 60)
+    test.assert_eq(max17048.hibrt_word(26624, 60), 0x8030)
+    // The two ends: disabled and always hibernating.
+    test.assert_eq(max17048.hibrt_word(0, 0), 0x0000)
+    test.assert_eq(max17048.hibrt_word(100000, 1000), 0xFFFF)
+    test.assert_eq(max17048.hibrt_word(-5, -5), 0x0000)
+    test.assert_eq(max17048.act_thr_mv(0x00FF), 318)
+
+@test
+fn test_valrt_is_a_window_in_20_millivolt_steps() [io]
+    // Power-up 0x00FF: minimum 0, maximum 255 steps, 5.1 V.
+    test.assert_eq(max17048.valrt_min_mv(0x00FF), 0)
+    test.assert_eq(max17048.valrt_max_mv(0x00FF), 5100)
+    // 3.0 V and 4.2 V.
+    test.assert_eq(max17048.valrt_word(3000, 4200), 0x96D2)
+    test.assert_eq(max17048.valrt_min_mv(0x96D2), 3000)
+    test.assert_eq(max17048.valrt_max_mv(0x96D2), 4200)
+    // Rounded to the nearest step, and held to the byte.
+    test.assert_eq(max17048.valrt_word(3011, 4189), 0x97D1)
+    test.assert_eq(max17048.valrt_word(-100, 9000), 0x00FF)
+
+@test
+fn test_vreset_is_a_7_bit_field_of_40_millivolt_steps() [io]
+    // Power-up 0x96__: 75 steps, 3.0 V ("trimmed at 3 V"), Dis clear.
+    test.assert_eq(max17048.vreset_mv(0x965A), 3000)
+    // 2.5 V for a captive battery: 62.5 steps, rounded to 63.
+    test.assert_eq(max17048.vreset_byte(2500, 0), 0x7E)
+    test.assert_eq(max17048.vreset_mv(0x7E00), 2520)
+    // The ends of the configurable range, 2.28 V and 3.48 V.
+    test.assert_eq(max17048.vreset_byte(2280, 0), 57 << 1)
+    test.assert_eq(max17048.vreset_byte(3480, 0), 87 << 1)
+    // Dis rides in bit 0; the field is held to its 7 bits.
+    test.assert_eq(max17048.vreset_byte(3000, 1), 0x97)
+    test.assert_eq(max17048.vreset_byte(99999, 0), 0xFE)
+    test.assert_eq(max17048.vreset_byte(-400, 0), 0x00)
+
+@test
+fn test_athd_is_32_minus_the_field() [io]
+    // Power-up 0x971C: ATHD 0x1C, 4%.
+    test.assert_eq(max17048.athd_percent(0x971C), 4)
+    test.assert_eq(max17048.athd_percent(0x0000), 32)
+    test.assert_eq(max17048.athd_percent(0x001F), 1)
+
+// ── The temperature compensation ─────────────────────────────────────
+
+@test
+fn test_rcomp_follows_the_data_sheets_formula() [io]
+    // RCOMP0 0x97 = 151, TempCoUp -0.5, TempCoDown -5.0.
+    // At 20 C, the term is 0.
+    test.assert_eq(max17048.rcomp_for(20000, 0x97, -500, -5000), 0x97)
+    // Above 20 C the up coefficient: 30 C is 151 + 10 x -0.5 = 146.
+    test.assert_eq(max17048.rcomp_for(30000, 0x97, -500, -5000), 146)
+    test.assert_eq(max17048.rcomp_for(60000, 0x97, -500, -5000), 131)
+    // Below 20 C the down coefficient: 0 C is 151 + (-20) x -5.0 = 251.
+    test.assert_eq(max17048.rcomp_for(0, 0x97, -500, -5000), 251)
+    test.assert_eq(max17048.rcomp_for(10000, 0x97, -500, -5000), 201)
+    // A result past a byte is held: -10 C would be 301, 120 C would be -299.
+    test.assert_eq(max17048.rcomp_for(-10000, 0x97, -500, -5000), 255)
+    test.assert_eq(max17048.rcomp_for(120000, 0x97, -5000, -5000), 0)
+    // The adjustment is truncated toward zero: 21.5 C is -0.75, 0.
+    test.assert_eq(max17048.rcomp_for(21500, 0x97, -500, -5000), 151)
+    // 85 C: 151 + 65 x -0.5 = 151 - 32.5; the adjustment is cut to -32.
+    test.assert_eq(max17048.rcomp_for(85000, 0x97, -500, -5000), 119)
+    // Another model's constants.
+    test.assert_eq(max17048.rcomp_for(30000, 0x80, -1000, -6000), 118)
+
+// ── Reading the part ─────────────────────────────────────────────────
+
+@test
+fn test_the_identity_is_the_version_register() [io, hw]
+    let g = gauge()
+    match max17048.identify(g, W)
+        Some(id) =>
+            test.assert_eq(id.who, 0x0010)
+            test.assert_eq(id.rev ?? -1, 2)
+        None => test.assert(false)
+    test.assert(max17048.start(g, W))
+    // The write count is 0: starting does not change the part.
+    test.assert_eq(at(g.log, -1), 0)
+
+@test
+fn test_another_family_or_no_part_is_not_identified() [io, hw]
+    let g = gauge()
+    // A MAX17043 family part answers another VERSION.
+    put(g, 0x08, 0x0003)
+    test.assert(max17048.identify(g, W) == None)
+    test.assert(not max17048.start(g, W))
+    test.assert(not max17048.start(absent(), W))
+    test.assert(max17048.version_read(absent(), W) == None)
+    // The low nibble is the revision and any nibble is a MAX17048.
+    put(g, 0x08, 0x001F)
+    test.assert(max17048.start(g, W))
+
+@test
+fn test_the_factory_identifier_is_the_low_byte_of_vreset() [io, hw]
+    let g = gauge()
+    test.assert_eq(max17048.chip_id(g, W) ?? -1, 0x5A)
+    test.assert(max17048.chip_id(absent(), W) == None)
+
+@test
+fn test_a_battery_reading_is_voltage_charge_and_direction() [io, hw]
+    let g = gauge()
+    put(g, 0x02, 0xB400)
+    put(g, 0x04, 0x5800)
+    put(g, 0x16, 0x0010)
+    match max17048.battery_read(g, W, 1)
+        Some(r) =>
+            test.assert_eq(r.voltage.mv, 3600)
+            test.assert_eq(r.current.ma, 0)
+            test.assert_eq(r.percent ?? -1, 88)
+            test.assert(r.charge == ChargeState.ChargeConstantCurrent)
+            test.assert(dev_power.power_is_charging(r.charge))
+        None => test.assert(false)
+    // Discharging, and a state of charge above 100.
+    put(g, 0x16, 0xFFF0)
+    put(g, 0x04, 0xFF00)
+    match max17048.battery_read(g, W, 1)
+        Some(r) =>
+            test.assert(r.charge == ChargeState.ChargeIdle)
+            test.assert_eq(r.percent ?? -1, 100)
+        None => test.assert(false)
+    // A rate of 0 is not charging.
+    put(g, 0x16, 0x0000)
+    match max17048.battery_read(g, W, 1)
+        Some(r) => test.assert(r.charge == ChargeState.ChargeIdle)
+        None => test.assert(false)
+    // The MAX17049's pack voltage.
+    match max17048.battery_read(g, W, 2)
+        Some(r) => test.assert_eq(r.voltage.mv, 7200)
+        None => test.assert(false)
+
+@test
+fn test_a_reading_needs_all_three_registers() [io, hw]
+    let g = gauge()
+    put(g, 0x02, 0xB400)
+    for reg in [0x02, 0x04, 0x16]
+        g.deaf.insert(reg, 1)
+        test.assert(max17048.battery_read(g, W, 1) == None)
+        g.deaf.clear()
+    test.assert(max17048.battery_read(g, W, 1) != None)
+    test.assert(max17048.battery_read(absent(), W, 1) == None)
+    test.assert(max17048.voltage_mv(absent(), W, 1) == None)
+    test.assert(max17048.soc_read(absent(), W) == None)
+    test.assert(max17048.crate_read(absent(), W) == None)
+
+@test
+fn test_single_figures() [io, hw]
+    let g = gauge()
+    put(g, 0x02, 0xB400)
+    put(g, 0x04, 0x3280)
+    put(g, 0x16, 0xFFFF)
+    test.assert_eq(max17048.voltage_mv(g, W, 1) ?? -1, 3600)
+    test.assert_eq(max17048.soc_read(g, W) ?? -1, 50500)
+    test.assert_eq(max17048.crate_read(g, W) ?? -1, -208)
+
+// ── Alerts ───────────────────────────────────────────────────────────
+
+@test
+fn test_the_status_flags_are_the_upper_byte() [io, hw]
+    let g = gauge()
+    // Power-up: RI is set.
+    test.assert_eq(max17048.status_read(g, W) ?? -1, max17048.STATUS_RI)
+    test.assert(max17048.reset_indicator(g, W) == Some(true))
+    put(g, 0x1A, 0x0000)
+    test.assert(max17048.reset_indicator(g, W) == Some(false))
+    test.assert(max17048.status_read(absent(), W) == None)
+    test.assert(max17048.reset_indicator(absent(), W) == None)
+
+@test
+fn test_clearing_a_flag_keeps_the_others_and_envr() [io, hw]
+    let g = gauge()
+    // EnVR and every flag set.
+    put(g, 0x1A, 0x7F00)
+    test.assert(max17048.status_clear(g, W, max17048.STATUS_SC))
+    test.assert_eq(word(g, 0x1A), 0x5F00)
+    test.assert(max17048.status_clear(g, W, max17048.STATUS_RI + max17048.STATUS_VH))
+    test.assert_eq(word(g, 0x1A), 0x5C00)
+    // EnVR is not a flag: a mask of 0x7F clears the flags and keeps it.
+    test.assert(max17048.status_clear(g, W, 0x7F))
+    test.assert_eq(word(g, 0x1A), 0x4000)
+    // Every write was a word.
+    test.assert(all_writes_are_words(g))
+    test.assert(not max17048.status_clear(absent(), W, 1))
+
+@test
+fn test_servicing_an_alert_clears_the_flag_then_the_pin() [io, hw]
+    let g = gauge()
+    // CONFIG: RCOMP 0x97, ALRT set, ATHD 4%.
+    put(g, 0x0C, 0x973C)
+    put(g, 0x1A, 0x3000)
+    test.assert(max17048.alert_active(g, W) == Some(true))
+    nothing(g)
+    // It answers the flags that were set: HD and SC.
+    test.assert_eq(max17048.alert_service(g, W, max17048.STATUS_HD), max17048.STATUS_HD + max17048.STATUS_SC)
+    test.assert_eq(word(g, 0x1A), 0x2000)
+    test.assert_eq(word(g, 0x0C), 0x971C)
+    test.assert(max17048.alert_active(g, W) == Some(false))
+    // The status was written before the configuration.
+    test.assert_eq(at(g.log, 0), 0x1A)
+    test.assert_eq(at(g.log, 4), 0x0C)
+    test.assert(all_writes_are_words(g))
+
+@test
+fn test_servicing_stops_at_the_first_refusal() [io, hw]
+    let g = gauge()
+    test.assert_eq(max17048.alert_service(absent(), W, 1), -1)
+    g.mute.insert(0x1A, 1)
+    test.assert_eq(max17048.alert_service(g, W, 1), -1)
+    g.mute.clear()
+    g.mute.insert(0x0C, 1)
+    test.assert_eq(max17048.alert_service(g, W, 1), -1)
+    test.assert(max17048.alert_active(absent(), W) == None)
+
+@test
+fn test_the_low_soc_threshold() [io, hw]
+    let g = gauge()
+    put(g, 0x0C, 0xAB3C)
+    test.assert(max17048.set_soc_alert(g, W, 10))
+    // ATHD = 22; RCOMP, ALSC, ALRT and SLEEP stay.
+    test.assert_eq(word(g, 0x0C), 0xAB36)
+    test.assert_eq(max17048.soc_alert(g, W) ?? -1, 10)
+    test.assert(max17048.set_soc_alert(g, W, 32))
+    test.assert_eq(word(g, 0x0C) & 0x1F, 0)
+    test.assert(max17048.set_soc_alert(g, W, 1))
+    test.assert_eq(word(g, 0x0C) & 0x1F, 31)
+    // Outside 1 to 32 nothing is written.
+    nothing(g)
+    test.assert(not max17048.set_soc_alert(g, W, 0))
+    test.assert(not max17048.set_soc_alert(g, W, 33))
+    test.assert_eq(at(g.log, -1), 0)
+    test.assert(not max17048.set_soc_alert(absent(), W, 5))
+    test.assert(max17048.soc_alert(absent(), W) == None)
+
+@test
+fn test_the_soc_change_alert() [io, hw]
+    let g = gauge()
+    test.assert(max17048.set_soc_change_alert(g, W, true))
+    test.assert_eq(word(g, 0x0C), 0x975C)
+    test.assert(max17048.set_soc_change_alert(g, W, false))
+    test.assert_eq(word(g, 0x0C), 0x971C)
+    test.assert(not max17048.set_soc_change_alert(absent(), W, true))
+    test.assert(not max17048.set_soc_change_alert(absent(), W, false))
+
+@test
+fn test_the_voltage_window() [io, hw]
+    let g = gauge()
+    test.assert(max17048.set_voltage_alert(g, W, 3000, 4200))
+    test.assert_eq(word(g, 0x14), 0x96D2)
+    test.assert_eq(max17048.voltage_alert(g, W) ?? -1, 0x96D2)
+    // A minimum above the maximum is refused and sends nothing.
+    nothing(g)
+    test.assert(not max17048.set_voltage_alert(g, W, 4200, 3000))
+    test.assert_eq(at(g.log, -1), 0)
+    test.assert(not max17048.set_voltage_alert(absent(), W, 3000, 4200))
+    test.assert(max17048.voltage_alert(absent(), W) == None)
+    // The window was written as one word of two bytes.
+    test.assert(max17048.set_voltage_alert(g, W, 3000, 4200))
+    test.assert_eq(at(g.log, -1), 4)
+    test.assert_eq(at(g.log, 1), 2)
+
+@test
+fn test_the_reset_voltage_keeps_dis_and_the_identifier() [io, hw]
+    let g = gauge()
+    test.assert_eq(max17048.reset_voltage(g, W) ?? -1, 3000)
+    test.assert(max17048.set_reset_voltage(g, W, 2500))
+    test.assert_eq(word(g, 0x18), 0x7E5A)
+    // With Dis set, the voltage changes and Dis stays.
+    put(g, 0x18, 0x975B)
+    test.assert(max17048.set_reset_voltage(g, W, 3480))
+    test.assert_eq(word(g, 0x18), 0xAF5B)
+    test.assert(not max17048.set_reset_voltage(absent(), W, 2500))
+    test.assert(max17048.reset_voltage(absent(), W) == None)
+
+@test
+fn test_the_reset_alert_enable() [io, hw]
+    let g = gauge()
+    test.assert(max17048.set_reset_alert(g, W, true))
+    // EnVR is bit 6 of the upper byte; RI stays set.
+    test.assert_eq(word(g, 0x1A), 0x4100)
+    test.assert(max17048.set_reset_alert(g, W, false))
+    test.assert_eq(word(g, 0x1A), 0x0100)
+    test.assert(not max17048.set_reset_alert(absent(), W, true))
+    test.assert(not max17048.set_reset_alert(absent(), W, false))
+
+@test
+fn test_the_alert_line() [io, hw]
+    let p = FakePins { levels: HashMap.new() }
+    p.levels.insert(7, 0)
+    test.assert_eq(max17048.irq_level_of(p, W), 0)
+    p.levels.insert(7, 1)
+    test.assert_eq(max17048.irq_level_of(p, W), 1)
+    test.assert_eq(max17048.irq_level_of(p, dev_bus.wiring_i2c(0, 0x36)), -1)
+
+// ── Modes ────────────────────────────────────────────────────────────
+
+@test
+fn test_a_quick_start_writes_the_bit_and_it_clears_itself() [io, hw]
+    let g = gauge()
+    nothing(g)
+    test.assert_eq(max17048.quick_start(g, W), 1000000)
+    // The word 0x4000 went to MODE; the part clears the bit.
+    test.assert_eq(at(g.log, 0), 0x06)
+    test.assert_eq(at(g.log, 2), 0x40)
+    test.assert_eq(at(g.log, 3), 0x00)
+    test.assert_eq(word(g, 0x06), 0x0000)
+    // The sleep enable, when the part reports it, is kept.
+    put(g, 0x06, 0x2000)
+    nothing(g)
+    test.assert_eq(max17048.quick_start(g, W), 1000000)
+    test.assert_eq(at(g.log, 2), 0x60)
+    test.assert_eq(max17048.quick_start(absent(), W), -1)
+    g.mute.insert(0x06, 1)
+    test.assert_eq(max17048.quick_start(g, W), -1)
+
+@test
+fn test_hibernate_thresholds_and_state() [io, hw]
+    let g = gauge()
+    test.assert(max17048.set_hibernate(g, W, 26624, 60))
+    test.assert_eq(max17048.hibrt_read(g, W) ?? -1, 0x8030)
+    test.assert(max17048.hibernate_never(g, W))
+    test.assert_eq(max17048.hibrt_read(g, W) ?? -1, 0x0000)
+    test.assert(max17048.hibernate_always(g, W))
+    test.assert_eq(max17048.hibrt_read(g, W) ?? -1, 0xFFFF)
+    test.assert(max17048.hibrt_read(absent(), W) == None)
+    // HibStat is bit 4 of the upper byte of MODE.
+    test.assert(max17048.hibernating(g, W) == Some(false))
+    put(g, 0x06, 0x1000)
+    test.assert(max17048.hibernating(g, W) == Some(true))
+    test.assert(max17048.hibernating(absent(), W) == None)
+
+@test
+fn test_sleep_needs_the_enable_and_wake_clears_it() [io, hw]
+    let g = gauge()
+    test.assert(max17048.set_sleep_enable(g, W, true))
+    test.assert_eq(word(g, 0x06), 0x2000)
+    test.assert(max17048.sleep(g, W))
+    test.assert_eq(word(g, 0x0C), 0x979C)
+    test.assert(max17048.wake(g, W))
+    test.assert_eq(word(g, 0x0C), 0x971C)
+    test.assert(max17048.set_sleep_enable(g, W, false))
+    test.assert_eq(word(g, 0x06), 0x0000)
+    test.assert(not max17048.sleep(absent(), W))
+    test.assert(not max17048.wake(absent(), W))
+
+@test
+fn test_a_reset_is_not_acknowledged_and_the_registers_return() [io, hw]
+    let g = gauge()
+    put(g, 0x0C, 0xA23C)
+    put(g, 0x1A, 0x0000)
+    nothing(g)
+    // The part answers before the command, then resets and does not
+    // acknowledge it; the driver does not treat that as a failure.
+    test.assert_eq(max17048.reset(g, W), 1000000)
+    test.assert_eq(at(g.log, 0), 0xFE)
+    test.assert_eq(at(g.log, 2), 0x54)
+    test.assert_eq(at(g.log, 3), 0x00)
+    test.assert_eq(word(g, 0x0C), 0x971C)
+    test.assert(max17048.reset_indicator(g, W) == Some(true))
+    // No part, no command.
+    let a = absent()
+    test.assert_eq(max17048.reset(a, W), -1)
+    test.assert_eq(at(a.log, -1), 0)
+
+// ── RCOMP ────────────────────────────────────────────────────────────
+
+@test
+fn test_rcomp_is_written_without_touching_the_alert_settings() [io, hw]
+    let g = gauge()
+    put(g, 0x0C, 0x973C)
+    test.assert_eq(max17048.rcomp_read(g, W) ?? -1, 0x97)
+    test.assert(max17048.rcomp_write(g, W, 0x42))
+    test.assert_eq(word(g, 0x0C), 0x423C)
+    test.assert_eq(max17048.rcomp_read(g, W) ?? -1, 0x42)
+    // Only the low eight bits of the value are used.
+    test.assert(max17048.rcomp_write(g, W, 0x1F0))
+    test.assert_eq(word(g, 0x0C), 0xF03C)
+    test.assert(not max17048.rcomp_write(absent(), W, 1))
+    test.assert(max17048.rcomp_read(absent(), W) == None)
+
+@test
+fn test_the_compensation_writes_the_rcomp_for_the_temperature() [io, hw]
+    let g = gauge()
+    test.assert_eq(max17048.compensate(g, W, 30000, 0x97, -500, -5000), 146)
+    test.assert_eq(word(g, 0x0C), 0x921C)
+    test.assert_eq(max17048.compensate(g, W, 0, 0x97, -500, -5000), 251)
+    test.assert_eq(word(g, 0x0C), 0xFB1C)
+    test.assert_eq(max17048.compensate(absent(), W, 0, 0x97, -500, -5000), -1)
+    // Every write of the run was a word.
+    test.assert(all_writes_are_words(g))
+
+@test
+fn test_every_write_of_a_session_is_a_word() [io, hw]
+    let g = gauge()
+    let _ = max17048.set_soc_alert(g, W, 12)
+    let _ = max17048.set_voltage_alert(g, W, 3000, 4200)
+    let _ = max17048.set_reset_voltage(g, W, 2500)
+    let _ = max17048.set_hibernate(g, W, 26624, 60)
+    let _ = max17048.set_sleep_enable(g, W, true)
+    let _ = max17048.sleep(g, W)
+    let _ = max17048.wake(g, W)
+    let _ = max17048.quick_start(g, W)
+    let _ = max17048.compensate(g, W, 12000, 0x97, -500, -5000)
+    let _ = max17048.alert_service(g, W, 0x3F)
+    test.assert(at(g.log, -1) > 0)
+    test.assert(all_writes_are_words(g))
+
+// ── The part on a board ──────────────────────────────────────────────
+
+@test
+fn test_the_types_answer_as_for_a_part_that_does_not_acknowledge() [io, hw]
+    let a = Max17048.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert(not a.begin())
+    test.assert(a.soc_milli_percent() == None)
+    test.assert(a.charge_rate() == None)
+    test.assert(a.status() == None)
+    test.assert_eq(a.alert_service(1), -1)
+    test.assert(not a.set_soc_alert(5))
+    test.assert(not a.set_voltage_alert(3000, 4200))
+    test.assert_eq(a.quick_start(), -1)
+    test.assert(not a.set_hibernate(0, 0))
+    test.assert(not a.sleep())
+    test.assert(not a.wake())
+    test.assert_eq(a.reset(), -1)
+    test.assert_eq(a.compensate(20000), -1)
+    test.assert(a.battery() == None)
+    test.assert(a.device_id() == None)
+    let b = Max17049.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert(not b.begin())
+    test.assert(b.soc_milli_percent() == None)
+    test.assert(b.charge_rate() == None)
+    test.assert_eq(b.reset(), -1)
+    test.assert_eq(b.compensate(20000), -1)
+    test.assert(b.battery() == None)
+    test.assert(b.device_id() == None)
+
+@test
+fn test_the_rest_of_the_power_manager_is_not_present() [io, hw]
+    let a = Max17048.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert_eq(a.rail_count(), 0)
+    test.assert(a.rail_state(0) == RailState.RailOff)
+    test.assert(not a.rail_is_on(0))
+    test.assert(a.rail_voltage(0) == None)
+    test.assert(a.rail_set_voltage(0, MilliVolts { mv: 1800 }) == None)
+    test.assert(not a.rail_enable(0, true))
+    test.assert(a.rail_current(0) == None)
+    let b = Max17049.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, W)
+    test.assert_eq(b.rail_count(), 0)
+    test.assert(b.rail_state(1) == RailState.RailOff)
+    test.assert(b.rail_voltage(0) == None)
+    test.assert(b.rail_set_voltage(0, MilliVolts { mv: 1800 }) == None)
+    test.assert(not b.rail_enable(0, false))
+    let _ = a.alert_level()
+
+// ── The register access ──────────────────────────────────────────────
+
+@test
+fn test_a_register_is_read_and_written_as_a_word() [io, hw]
+    let g = gauge()
+    put(g, 0x02, 0xB400)
+    test.assert_eq(max17048.read_word(g, W, 0x02) ?? -1, 0xB400)
+    test.assert(max17048.read_word(absent(), W, 0x02) == None)
+    nothing(g)
+    test.assert(max17048.write_word(g, W, 0x14, 0x96D2))
+    // The register, then the count, then the two bytes, most significant first.
+    test.assert_eq(at(g.log, 0), 0x14)
+    test.assert_eq(at(g.log, 1), 2)
+    test.assert_eq(at(g.log, 2), 0x96)
+    test.assert_eq(at(g.log, 3), 0xD2)
+    test.assert_eq(word(g, 0x14), 0x96D2)
+    test.assert(not max17048.write_word(absent(), W, 0x14, 1))
+
+@test
+fn test_an_update_reads_clears_sets_and_writes_the_word() [io, hw]
+    let g = gauge()
+    put(g, 0x0C, 0x971C)
+    // Clear the low nibble of the upper byte and set the top bit.
+    test.assert_eq(max17048.update_word(g, W, 0x0C, 0x0F00, 0x8000), 0x901C)
+    test.assert_eq(word(g, 0x0C), 0x901C)
+    // -1 when the part does not answer the read or the write.
+    test.assert_eq(max17048.update_word(absent(), W, 0x0C, 0, 0), -1)
+    g.mute.insert(0x0C, 1)
+    test.assert_eq(max17048.update_word(g, W, 0x0C, 0, 1), -1)
+
+@test
+fn test_the_alert_pin_is_released_by_clearing_config_alrt() [io, hw]
+    let g = gauge()
+    put(g, 0x0C, 0x973C)
+    test.assert(max17048.alert_pin_clear(g, W))
+    test.assert_eq(word(g, 0x0C), 0x971C)
+    test.assert(not max17048.alert_pin_clear(absent(), W))
