@@ -1,6 +1,6 @@
 [package]
 name        = "max17048-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for Analog Devices' MAX17048 and MAX17049 battery fuel gauges on an I2C bus: the cell voltage in millivolts, the state of charge in 1/256 percent, the charge rate, the alerts, quick start, hibernate and sleep, the reset, and the RCOMP update against temperature, as devices-nv's PowerManager battery side and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -26,7 +26,7 @@ tier = "embedded"
 [dependencies]
 # The board's I2C bus and GPIO handles, and the I2cBus and GpioOut
 # traits they implement.
-embedded-hal-nv = "^0.3.2"
+embedded-hal-nv = "^0.4.0"
 # The wiring record a board's device table hands `attach`, the register
 # helpers, and the PowerManager and Identifiable traits.
-devices-nv      = "^0.3.2"
+devices-nv      = "^0.4.0"
